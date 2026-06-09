@@ -66,8 +66,9 @@
           />
         </EditorialShelf>
       </div>
-      <!-- tracks-only searchresult -->
-      <div v-else-if="!loading">
+      <!-- tracks-only searchresult: render progressively while the stream is
+           still landing chunks; the progress bar above is the loading affordance. -->
+      <div v-else>
         <ItemsListing
           :itemtype="`${store.globalSearchType}s`"
           :show-provider="true"
@@ -101,7 +102,7 @@ import { useUserPreferences } from "@/composables/userPreferences";
 import { panelViewItemResponsive } from "@/helpers/utils";
 import { api } from "@/plugins/api";
 import { itemIsAvailable } from "@/plugins/api/helpers";
-import { MediaType, SearchResults } from "@/plugins/api/interfaces";
+import { Genre, MediaType, SearchResults } from "@/plugins/api/interfaces";
 import { $t } from "@/plugins/i18n";
 import { store } from "@/plugins/store";
 import { computed, onBeforeUnmount, onMounted, ref, watch } from "vue";
@@ -122,15 +123,75 @@ const searchHasFocus = ref(false);
 const searchResult = ref<SearchResults>();
 const loading = ref(false);
 const throttleId = ref();
+// AbortController for the in-flight streaming search; abort it when a new
+// search starts so we don't merge stale chunks into the new result.
+const streamAbort = ref<AbortController>();
 const { getPreference, setPreference } = useUserPreferences();
+
+// Helper: dedupe by `uri` (every MediaItem carries one) while preserving order.
+// Used to merge progressive chunks without duplicating items the library and
+// providers both surface.
+function dedupByUri<T extends { uri?: string }>(items: T[]): T[] {
+  const seen = new Set<string>();
+  const out: T[] = [];
+  for (const item of items) {
+    const key = item.uri ?? `${out.length}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(item);
+  }
+  return out;
+}
+
+// Merge a streamed chunk into the accumulator. Re-emits a NEW SearchResults
+// object so Vue's reactivity picks up the change cheaply (one ref assignment).
+function mergeChunk(
+  acc: SearchResults,
+  chunk: SearchResults,
+  limit: number,
+): SearchResults {
+  return {
+    artists: dedupByUri([
+      ...(acc.artists ?? []),
+      ...(chunk.artists ?? []),
+    ]).slice(0, limit),
+    albums: dedupByUri([...(acc.albums ?? []), ...(chunk.albums ?? [])]).slice(
+      0,
+      limit,
+    ),
+    tracks: dedupByUri([...(acc.tracks ?? []), ...(chunk.tracks ?? [])]).slice(
+      0,
+      limit,
+    ),
+    playlists: dedupByUri([
+      ...(acc.playlists ?? []),
+      ...(chunk.playlists ?? []),
+    ]).slice(0, limit),
+    radio: dedupByUri([...(acc.radio ?? []), ...(chunk.radio ?? [])]).slice(
+      0,
+      limit,
+    ),
+    podcasts: dedupByUri([
+      ...(acc.podcasts ?? []),
+      ...(chunk.podcasts ?? []),
+    ]).slice(0, limit),
+    audiobooks: dedupByUri([
+      ...(acc.audiobooks ?? []),
+      ...(chunk.audiobooks ?? []),
+    ]).slice(0, limit),
+    genres: acc.genres ?? chunk.genres ?? [],
+  };
+}
 
 // Responsive tile sizing, shared curve with the rest of the app.
 const tilesPerView = computed(() => panelViewItemResponsive(0) + 0.5);
 
 // Compact "all" results as horizontal shelves; empty categories are hidden.
+// NOTE: render-while-loading is intentional - the progress bar above provides
+// the loading affordance while shelves fill in progressively from the stream.
 const searchSections = computed(() => {
   const r = searchResult.value;
-  if (!r || loading.value) return [];
+  if (!r) return [];
   return [
     { key: "tracks", title: $t("tracks"), items: r.tracks },
     { key: "artists", title: $t("artists"), items: r.artists },
@@ -169,51 +230,106 @@ const loadSearchResults = async function (
   searchTerm?: string,
   filter?: MediaType,
 ) {
-  loading.value = true;
+  // Cancel any in-flight stream from a previous query so its late chunks do
+  // not leak into the new searchResult.
+  streamAbort.value?.abort();
+
   setPreference("globalSearch", searchTerm || "");
   const limit = store.globalSearchType ? 50 : 8;
   const mediaTypes = filter ? [filter] : undefined;
-  if (searchTerm) {
-    if (filter === MediaType.GENRE) {
-      // Genre-only search: use library search directly
-      const genres = await api.getLibraryGenres({
+
+  if (!searchTerm) {
+    searchResult.value = undefined;
+    loading.value = false;
+    return;
+  }
+
+  loading.value = true;
+
+  // Genre-only search: pure library lookup, no streaming needed.
+  if (filter === MediaType.GENRE) {
+    const genres = await api.getLibraryGenres({
+      search: searchTerm,
+      limit,
+      offset: 0,
+      order_by: "name",
+    });
+    searchResult.value = {
+      artists: [],
+      albums: [],
+      tracks: [],
+      playlists: [],
+      radio: [],
+      podcasts: [],
+      audiobooks: [],
+      genres,
+    };
+    loading.value = false;
+    return;
+  }
+
+  // Set up the streaming search and the parallel genre supplement.
+  const ac = new AbortController();
+  streamAbort.value = ac;
+
+  // Start with an empty accumulator so the EditorialShelf rows render the
+  // moment the first chunk lands - no blank screen while we wait.
+  let acc: SearchResults = {
+    artists: [],
+    albums: [],
+    tracks: [],
+    playlists: [],
+    radio: [],
+    podcasts: [],
+    audiobooks: [],
+    genres: [],
+  };
+  searchResult.value = acc;
+
+  const genresPromise: Promise<Genre[]> = !filter
+    ? api.getLibraryGenres({
         search: searchTerm,
         limit,
         offset: 0,
         order_by: "name",
-      });
-      searchResult.value = {
-        artists: [],
-        albums: [],
-        tracks: [],
-        playlists: [],
-        radio: [],
-        podcasts: [],
-        audiobooks: [],
-        genres,
-      };
-    } else {
-      // Standard search + supplement with genre results
-      const [results, genres] = await Promise.all([
-        api.search(searchTerm, mediaTypes, limit),
-        !filter
-          ? api.getLibraryGenres({
-              search: searchTerm,
-              limit,
-              offset: 0,
-              order_by: "name",
-            })
-          : Promise.resolve([]),
-      ]);
-      searchResult.value = {
-        ...results,
-        genres: results.genres?.length ? results.genres : genres,
-      };
+      })
+    : Promise.resolve([]);
+
+  try {
+    for await (const chunk of api.searchStream(
+      searchTerm,
+      mediaTypes,
+      limit,
+      ac.signal,
+    )) {
+      if (ac.signal.aborted) return;
+      acc = mergeChunk(acc, chunk, limit);
+      // Reassign the ref so Vue picks up the merged result on every chunk.
+      searchResult.value = acc;
     }
-  } else {
-    searchResult.value = undefined;
+  } catch (err) {
+    if (err instanceof DOMException && err.name === "AbortError") {
+      // a newer search took over; nothing to do
+      return;
+    }
+    // unexpected stream error: log + leave whatever we have rendered
+    console.error("[Search] streaming search failed:", err);
   }
-  loading.value = false;
+
+  // The streamed result usually carries genres in the library chunk; only
+  // supplement from getLibraryGenres if the stream did not surface any.
+  if (!ac.signal.aborted) {
+    const genres = await genresPromise;
+    if (!ac.signal.aborted && !acc.genres?.length) {
+      acc = { ...acc, genres };
+      searchResult.value = acc;
+    }
+  }
+
+  if (streamAbort.value === ac) {
+    loading.value = false;
+    streamAbort.value = undefined;
+  }
 };
 
 onMounted(() => {

@@ -103,11 +103,30 @@ export class MusicAssistantApi {
       reject: (err: unknown) => void;
     }
   >;
+  /**
+   * Subscribers for streaming commands (handlers decorated server-side with
+   * @api_command(..., partial_per_yield=True)). Each partial=True frame is
+   * dispatched directly to the subscriber's enqueue() instead of being
+   * accumulated; the partial=False terminator triggers complete().
+   *
+   * Streaming commands DO NOT register in `commands` (no Promise), so
+   * handleResultMessage routes them here first before falling through to the
+   * legacy accumulate-and-resolve path.
+   */
+  private streamingCommands: Map<
+    string,
+    {
+      enqueue: (chunk: unknown) => void;
+      complete: () => void;
+      fail: (err: unknown) => void;
+    }
+  >;
 
   constructor() {
     this.eventCallbacks = [];
     this.commands = new Map();
     this.partialResult = {};
+    this.streamingCommands = new Map();
   }
 
   /**
@@ -1403,6 +1422,62 @@ export class MusicAssistantApi {
     });
   }
 
+  /**
+   * Perform a streaming global search.
+   *
+   * Yields one SearchResults per chunk as each music/plugin provider's results
+   * arrive (library results yield first). Falls back automatically to the
+   * non-streaming `music/search` when the server does not support
+   * `music/search_stream` (i.e. older Music Assistant versions).
+   *
+   * Pass an `AbortSignal` to cancel an in-flight stream (e.g. when the user
+   * types a new query); the iterator throws an AbortError and the server-side
+   * tasks are torn down on disconnect.
+   *
+   * Wire shape: each server-side `yield SearchResults(...)` produces one
+   * `partial=True` frame carrying `result: [SearchResults]`. This wrapper
+   * unwraps the single-item list so consumers see a clean
+   * `AsyncGenerator<SearchResults>`.
+   */
+  public async *searchStream(
+    search_query: string,
+    media_types?: MediaType[],
+    limit?: number,
+    signal?: AbortSignal,
+  ): AsyncGenerator<SearchResults, void, void> {
+    try {
+      const iter = this.sendStreamingCommand<SearchResults[]>(
+        "music/search_stream",
+        {
+          search_query,
+          media_types,
+          limit,
+        },
+        signal,
+      );
+      for await (const chunk of iter) {
+        if (!chunk || chunk.length === 0) continue;
+        for (const result of chunk) {
+          yield result;
+        }
+      }
+    } catch (err) {
+      // bubble aborts
+      if (err instanceof DOMException && err.name === "AbortError") {
+        throw err;
+      }
+      // server does not know the command (older MA): fall back to single-shot search
+      if (DEBUG) {
+        console.warn(
+          "[searchStream] falling back to non-streaming music/search:",
+          err,
+        );
+      }
+      const result = await this.search(search_query, media_types, limit);
+      yield result;
+    }
+  }
+
   public async getRecentlyPlayedItems(
     limit = 10,
     media_types?: MediaType[],
@@ -2328,6 +2403,26 @@ export class MusicAssistantApi {
 
   private handleResultMessage(msg: SuccessResultMessage | ErrorResultMessage) {
     // Handle result of a command
+    // Streaming subscribers (music/search_stream and other partial_per_yield
+    // commands) own their message_id - route directly to them and skip the
+    // single-Promise accumulate path.
+    const streaming = this.streamingCommands.get(msg.message_id);
+    if (streaming) {
+      if ("error_code" in msg) {
+        const errMsg = msg as ErrorResultMessage;
+        streaming.fail(errMsg.details || errMsg.error_code);
+        return;
+      }
+      const successMsg = msg as SuccessResultMessage;
+      if ("partial" in successMsg && successMsg.partial) {
+        streaming.enqueue(successMsg.result);
+      } else {
+        // partial=false = end-of-stream terminator
+        streaming.complete();
+      }
+      return;
+    }
+
     const resultPromise = this.commands.get(msg.message_id);
 
     if ("error_code" in msg) {
@@ -2819,6 +2914,98 @@ export class MusicAssistantApi {
       });
       this._sendCommand(command, args, cmdId);
     });
+  }
+
+  /**
+   * Send a command whose server-side handler is an async generator decorated
+   * with `@api_command(..., partial_per_yield=True)`. Yields each
+   * `partial=True` frame's `result` as it arrives and completes on the
+   * `partial=False` terminator (or rejects on an error frame).
+   *
+   * The iterator yields the RAW `result` field of each partial frame - the
+   * server wraps each yield as `[item]`, so a per-yield handler's wire shape
+   * is `unknown[]` per chunk. Use a typed wrapper (e.g. `searchStream`) to
+   * unwrap.
+   *
+   * Pass an `AbortSignal` to interrupt - the next `await` throws an AbortError
+   * and the iterator's finally-block unregisters from `streamingCommands`.
+   * Note: there is no server-side cancel message; the server simply drains
+   * the stream into a dropped Promise once the websocket closes (or, for
+   * music/search_stream specifically, its finally-block tears down the
+   * pending provider tasks).
+   */
+  public async *sendStreamingCommand<TChunk>(
+    command: string,
+    args?: Record<string, unknown>,
+    signal?: AbortSignal,
+  ): AsyncGenerator<TChunk, void, void> {
+    const cmdId = this._genCmdId();
+    const queue: TChunk[] = [];
+    let resolveWait: (() => void) | null = null;
+    let completed = false;
+    let error: unknown = null;
+
+    const wake = (): void => {
+      if (resolveWait) {
+        const r = resolveWait;
+        resolveWait = null;
+        r();
+      }
+    };
+
+    this.streamingCommands.set(cmdId, {
+      enqueue: (chunk) => {
+        queue.push(chunk as TChunk);
+        wake();
+      },
+      complete: () => {
+        completed = true;
+        wake();
+      },
+      fail: (err) => {
+        error = err;
+        completed = true;
+        wake();
+      },
+    });
+
+    const onAbort = (): void => {
+      error = signal?.reason ?? new DOMException("Aborted", "AbortError");
+      completed = true;
+      wake();
+    };
+    if (signal) {
+      if (signal.aborted) {
+        onAbort();
+      } else {
+        signal.addEventListener("abort", onAbort, { once: true });
+      }
+    }
+
+    try {
+      this._sendCommand(command, args, cmdId);
+    } catch (e) {
+      this.streamingCommands.delete(cmdId);
+      if (signal) signal.removeEventListener("abort", onAbort);
+      throw e;
+    }
+
+    try {
+      // drain loop: emit any queued chunks, then wait for the next signal
+      while (true) {
+        while (queue.length > 0) {
+          yield queue.shift() as TChunk;
+        }
+        if (error) throw error;
+        if (completed) return;
+        await new Promise<void>((resolve) => {
+          resolveWait = resolve;
+        });
+      }
+    } finally {
+      this.streamingCommands.delete(cmdId);
+      if (signal) signal.removeEventListener("abort", onAbort);
+    }
   }
 
   private _sendCommand(
